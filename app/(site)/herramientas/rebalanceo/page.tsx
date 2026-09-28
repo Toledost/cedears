@@ -9,7 +9,7 @@ import { buildPageOpenGraph } from "@/lib/site"
 
 const title = "Calculadora de rebalanceo de CEDEARs"
 const description =
-  "Ingresá tus nominales de cada CEDEAR, visualizá la composición actual de tu cartera en un donut chart y calculá las operaciones de compra y venta para llegar a tu distribución objetivo."
+  "Ingresá tus nominales de cada CEDEAR, visualizá la composición actual de tu cartera en un donut chart y calculá las operaciones para llegar a tu distribución objetivo: comprando y vendiendo, o solo comprando con un aporte nuevo."
 
 export const revalidate = 300
 
@@ -53,7 +53,8 @@ export default async function RebalanceoPage() {
           </h1>
           <p className="text-muted-foreground text-pretty">
             Cargá cuántos nominales tenés de cada CEDEAR, definí tu composición
-            objetivo y obtené las operaciones de compra y venta para rebalancear.
+            objetivo y obtené las operaciones para rebalancear: con compras y
+            ventas, o solo con compras invirtiendo dinero nuevo.
           </p>
         </div>
       </header>
