@@ -79,39 +79,78 @@ export function computeRebalance(inputs: RebalanceInput[]): RebalanceResult {
   const targetSum = inputs.reduce((acc, i) => acc + Math.max(i.targetPct, 0), 0)
   const normFactor = targetSum > 0 ? targetSum : 1
 
-  let allocatedNewValue = 0
-
-  const rows: RebalanceRow[] = inputs.map((input) => {
+  const base = inputs.map((input) => {
     const price = input.cedear.price
     const quantity = Math.max(input.quantity, 0)
     const targetPct = Math.max(input.targetPct, 0)
     const currentValue = price !== null ? price * quantity : 0
-    const normalizedTargetPct = (targetPct / normFactor) * 100
     const targetValue = totalValue * (targetPct / normFactor)
+    const tradable = price !== null && price > 0
+    return { input, price, quantity, targetPct, currentValue, targetValue, tradable }
+  })
 
-    let deltaNominales = 0
-    let newQuantity = quantity
+  const newQuantities = base.map((b) =>
+    b.tradable && b.price !== null
+      ? Math.max(b.quantity + Math.round((b.targetValue - b.currentValue) / b.price), 0)
+      : b.quantity,
+  )
 
-    if (price !== null && price > 0) {
-      deltaNominales = Math.round((targetValue - currentValue) / price)
-      newQuantity = Math.max(quantity + deltaNominales, 0)
-      deltaNominales = newQuantity - quantity
-    }
+  // Redondear cada operación por separado puede hacer que las compras cuesten
+  // más de lo que entra por ventas. Mientras falte efectivo, sacamos de a un
+  // nominal del activo que más se pasa de su objetivo.
+  let cash =
+    totalValue -
+    base.reduce((acc, b, index) => acc + (b.price ?? 0) * newQuantities[index], 0)
+  const EPSILON = 1e-6
+  while (cash < -EPSILON) {
+    let worst = -1
+    let worstExcess = -Infinity
+    base.forEach((b, index) => {
+      if (!b.tradable || b.price === null || newQuantities[index] < 1) return
+      const excess = newQuantities[index] * b.price - b.targetValue
+      if (excess > worstExcess) {
+        worst = index
+        worstExcess = excess
+      }
+    })
+    if (worst === -1) break
+    newQuantities[worst] -= 1
+    cash += base[worst].price ?? 0
+  }
 
-    const newValue = price !== null ? price * newQuantity : 0
-    allocatedNewValue += newValue
+  // Con el efectivo que sobra, compramos de a un nominal del activo que más
+  // lejos quede de su objetivo, mientras alcance y el nominal lo acerque al
+  // objetivo (le falte al menos medio nominal).
+  for (;;) {
+    let best = -1
+    let bestGap = 0
+    base.forEach((b, index) => {
+      if (!b.tradable || b.price === null || b.price > cash + EPSILON) return
+      const gap = b.targetValue - newQuantities[index] * b.price
+      if (gap >= b.price / 2 && gap > bestGap) {
+        best = index
+        bestGap = gap
+      }
+    })
+    if (best === -1) break
+    newQuantities[best] += 1
+    cash -= base[best].price ?? 0
+  }
 
+  const rows: RebalanceRow[] = base.map((b, index) => {
+    const newQuantity = newQuantities[index]
+    const newValue = b.price !== null ? b.price * newQuantity : 0
     return {
-      ticker: input.cedear.Cedears,
-      name: input.cedear.Name,
-      tickerOriginal: input.cedear.TickerOriginal,
-      price,
-      quantity,
-      currentValue,
-      currentPct: totalValue > 0 ? (currentValue / totalValue) * 100 : 0,
-      normalizedTargetPct,
-      targetValue,
-      deltaNominales,
+      ticker: b.input.cedear.Cedears,
+      name: b.input.cedear.Name,
+      tickerOriginal: b.input.cedear.TickerOriginal,
+      price: b.price,
+      quantity: b.quantity,
+      currentValue: b.currentValue,
+      currentPct: totalValue > 0 ? (b.currentValue / totalValue) * 100 : 0,
+      normalizedTargetPct: (b.targetPct / normFactor) * 100,
+      targetValue: b.targetValue,
+      deltaNominales: newQuantity - b.quantity,
       newQuantity,
       newValue,
       newPct: totalValue > 0 ? (newValue / totalValue) * 100 : 0,
@@ -122,7 +161,7 @@ export function computeRebalance(inputs: RebalanceInput[]): RebalanceResult {
     rows,
     totalValue,
     targetSum,
-    residualCash: totalValue - allocatedNewValue,
+    residualCash: Math.max(cash, 0),
     hasMissingPrices: inputs.some((i) => i.cedear.price === null),
   }
 }
@@ -133,6 +172,91 @@ export type PortfolioEntry = {
   ticker: string
   quantity: number
   targetPct: number
+}
+
+/* Persistencia de la calculadora en el navegador -------------------- */
+
+export type RebalanceMode = "rebalance" | "accumulate"
+
+/** Fila de la calculadora: el color es fijo por ticker aunque se reordene. */
+export type RebalanceEntry = PortfolioEntry & { colorIndex: number }
+
+/** Asigna colores consecutivos a entradas que todavía no tienen uno. */
+export function withColorIndexes(entries: PortfolioEntry[]): RebalanceEntry[] {
+  return entries.map((entry, index) => ({ ...entry, colorIndex: index }))
+}
+
+/** El primer color libre, para que un ticker nuevo no repita uno en uso. */
+export function nextColorIndex(entries: RebalanceEntry[]): number {
+  const used = new Set(entries.map((e) => e.colorIndex))
+  let index = 0
+  while (used.has(index)) index++
+  return index
+}
+
+export type SavedRebalanceState = {
+  rows: RebalanceEntry[]
+  mode: RebalanceMode
+  contribution: number
+}
+
+const REBALANCE_STORAGE_KEY = "cedears-rebalance-state"
+
+function nonNegative(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0
+}
+
+export function readRebalanceState(): SavedRebalanceState | null {
+  if (typeof window === "undefined") return null
+
+  try {
+    const raw = localStorage.getItem(REBALANCE_STORAGE_KEY)
+    if (raw === null) return null
+    const data: unknown = JSON.parse(raw)
+    if (typeof data !== "object" || data === null) return null
+    const record = data as Record<string, unknown>
+
+    const rows: RebalanceEntry[] = []
+    if (Array.isArray(record.rows)) {
+      for (const row of record.rows) {
+        if (typeof row !== "object" || row === null) continue
+        const { ticker, quantity, targetPct, colorIndex } = row as Record<string, unknown>
+        if (typeof ticker !== "string" || ticker.trim() === "") continue
+        if (rows.some((r) => r.ticker === ticker)) continue
+        const color =
+          typeof colorIndex === "number" &&
+          Number.isInteger(colorIndex) &&
+          colorIndex >= 0 &&
+          !rows.some((r) => r.colorIndex === colorIndex)
+            ? colorIndex
+            : nextColorIndex(rows)
+        rows.push({
+          ticker,
+          quantity: nonNegative(quantity),
+          targetPct: nonNegative(targetPct),
+          colorIndex: color,
+        })
+      }
+    }
+
+    return {
+      rows,
+      mode: record.mode === "accumulate" ? "accumulate" : "rebalance",
+      contribution: nonNegative(record.contribution),
+    }
+  } catch {
+    return null
+  }
+}
+
+export function writeRebalanceState(state: SavedRebalanceState): void {
+  if (typeof window === "undefined") return
+
+  try {
+    localStorage.setItem(REBALANCE_STORAGE_KEY, JSON.stringify(state))
+  } catch {
+    // Almacenamiento lleno o bloqueado (modo privado): seguimos sin guardar.
+  }
 }
 
 const PORTFOLIO_CSV_HEADER = "ticker,nominales,objetivo_pct"

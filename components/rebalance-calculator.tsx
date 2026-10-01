@@ -1,13 +1,22 @@
 "use client"
 
-import { useMemo, useRef, useState, type ChangeEvent } from "react"
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type KeyboardEvent,
+  type PointerEvent,
+} from "react"
 import {
   ArrowDownIcon,
+  ArrowUpDownIcon,
   ArrowUpIcon,
   DownloadIcon,
   FileDownIcon,
   FileUpIcon,
-  LandmarkIcon,
+  GripVerticalIcon,
   ScaleIcon,
   Trash2Icon,
 } from "lucide-react"
@@ -15,7 +24,6 @@ import { toast } from "sonner"
 
 import { BOND_QUOTE_BASIS, type Bond } from "@/lib/bonds"
 import { type Cedear, formatArs } from "@/lib/cedears"
-import { logoUrl } from "@/lib/logo"
 import { readPortfolioHoldings } from "@/lib/portfolio"
 import {
   computeAccumulation,
@@ -24,7 +32,14 @@ import {
   formatPercent,
   parsePortfolioCsv,
   portfolioToCsv,
+  readRebalanceState,
+  writeRebalanceState,
   type RebalanceInput,
+  type RebalanceMode,
+  type RebalanceEntry,
+  type RebalanceRow,
+  nextColorIndex,
+  withColorIndexes,
 } from "@/lib/tools"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -47,13 +62,9 @@ import {
   EmptyTitle,
 } from "@/components/ui/empty"
 
-type RowState = {
-  ticker: string
-  quantity: number
-  targetPct: number
-}
+type RowState = RebalanceEntry
 
-type Mode = "rebalance" | "accumulate"
+type Mode = RebalanceMode
 
 type Asset = {
   ticker: string
@@ -80,6 +91,44 @@ const MODES: { value: Mode; label: string; description: string }[] = [
 
 const numericCell = "text-right font-mono tabular-nums"
 
+type SortKey = "ticker" | "price" | "quantity" | "currentValue" | "currentPct" | "targetPct"
+type SortDir = "asc" | "desc"
+
+function SortButton({
+  label,
+  active,
+  direction,
+  onClick,
+}: {
+  label: string
+  active: boolean
+  direction: SortDir
+  onClick: () => void
+}) {
+  const Icon = !active ? ArrowUpDownIcon : direction === "asc" ? ArrowUpIcon : ArrowDownIcon
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="inline-flex items-center gap-1 font-medium hover:text-foreground"
+    >
+      {label}
+      <Icon className="size-3.5 opacity-60" />
+    </button>
+  )
+}
+
+function ColorDot({ color }: { color: string | undefined }) {
+  return (
+    <span
+      aria-hidden
+      className="size-2.5 shrink-0 rounded-full"
+      style={{ backgroundColor: color }}
+    />
+  )
+}
+
 export function RebalanceCalculator({
   cedears,
   bonds = [],
@@ -90,6 +139,25 @@ export function RebalanceCalculator({
   const [rows, setRows] = useState<RowState[]>([])
   const [mode, setMode] = useState<Mode>("rebalance")
   const [contribution, setContribution] = useState<number>(100000)
+  const [restored, setRestored] = useState(false)
+
+  // La página se renderiza en el servidor sin cartera; la guardada se lee
+  // recién al montar para no romper la hidratación.
+  useEffect(() => {
+    const saved = readRebalanceState()
+    if (saved) {
+      setRows(saved.rows)
+      setMode(saved.mode)
+      setContribution(saved.contribution)
+    }
+    setRestored(true)
+  }, [])
+
+  // No guardar antes de restaurar: pisaría la cartera guardada con la vacía.
+  useEffect(() => {
+    if (!restored) return
+    writeRebalanceState({ rows, mode, contribution })
+  }, [restored, rows, mode, contribution])
 
   const assetByTicker = useMemo(() => {
     const assets = new Map<string, Asset>()
@@ -129,12 +197,23 @@ export function RebalanceCalculator({
     setRows((current) =>
       current.some((r) => r.ticker === ticker)
         ? current
-        : [...current, { ticker, quantity: 0, targetPct: 0 }],
+        : [
+            ...current,
+            { ticker, quantity: 0, targetPct: 0, colorIndex: nextColorIndex(current) },
+          ],
     )
   }
 
   function removeTicker(ticker: string) {
     setRows((current) => current.filter((r) => r.ticker !== ticker))
+  }
+
+  function clearPortfolio() {
+    const previous = rows
+    setRows([])
+    toast.success("Cartera vaciada", {
+      action: { label: "Deshacer", onClick: () => setRows(previous) },
+    })
   }
 
   function updateRow(ticker: string, patch: Partial<RowState>) {
@@ -150,11 +229,13 @@ export function RebalanceCalculator({
     )
     if (entries.length === 0) return
     setRows(
-      entries.map(([ticker, quantity]) => ({
-        ticker,
-        quantity,
-        targetPct: 0,
-      })),
+      withColorIndexes(
+        entries.map(([ticker, quantity]) => ({
+          ticker,
+          quantity,
+          targetPct: 0,
+        })),
+      ),
     )
   }
 
@@ -192,7 +273,7 @@ export function RebalanceCalculator({
       return
     }
 
-    setRows(known)
+    setRows(withColorIndexes(known))
     toast.success("Cartera importada", {
       description:
         unknown.length > 0
@@ -250,32 +331,153 @@ export function RebalanceCalculator({
   )
   const result = accumulation ?? rebalance!
 
+  // Cada fila guarda su color, así un ticker conserve el mismo color en la
+  // tabla y en los gráficos aunque se ordene o se arrastre a otra posición.
+  const colorByTicker = useMemo(
+    () => new Map(rows.map((r) => [r.ticker, donutColor(r.colorIndex)])),
+    [rows],
+  )
+
+  const [sort, setSort] = useState<{ key: SortKey; dir: SortDir } | null>(null)
+  const [editing, setEditing] = useState(false)
+  const [dragging, setDragging] = useState<string | null>(null)
+  const displayOrderRef = useRef<string[]>([])
+
+  function toggleSort(key: SortKey) {
+    setSort((current) =>
+      current?.key === key
+        ? { key, dir: current.dir === "asc" ? "desc" : "asc" }
+        : { key, dir: key === "ticker" ? "asc" : "desc" },
+    )
+  }
+
+  /** Mueve `ticker` a la posición que hoy ocupa `target` en la tabla. */
+  function moveRow(ticker: string, target: string) {
+    if (ticker === target) return
+    setRows((current) => {
+      const from = current.findIndex((r) => r.ticker === ticker)
+      const to = current.findIndex((r) => r.ticker === target)
+      if (from === -1 || to === -1) return current
+      const next = [...current]
+      const [moved] = next.splice(from, 1)
+      next.splice(to, 0, moved)
+      return next
+    })
+  }
+
+  /**
+   * Reordenar a mano parte de lo que se ve: si la tabla estaba ordenada por
+   * una columna, ese orden pasa a ser el orden propio de la cartera.
+   */
+  function adoptDisplayOrder() {
+    if (!sort) return
+    const order = displayOrderRef.current
+    setRows((current) =>
+      [...current].sort((a, b) => {
+        const ia = order.indexOf(a.ticker)
+        const ib = order.indexOf(b.ticker)
+        return (ia === -1 ? Infinity : ia) - (ib === -1 ? Infinity : ib)
+      }),
+    )
+    setSort(null)
+  }
+
+  // Arrastre con pointer events: anda igual con mouse y con el dedo.
+  function startDrag(ticker: string, event: PointerEvent<HTMLButtonElement>) {
+    if (event.button !== 0) return
+    event.preventDefault()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    adoptDisplayOrder()
+    setDragging(ticker)
+  }
+
+  function dragOver(event: PointerEvent<HTMLButtonElement>) {
+    if (!dragging) return
+    const target = document
+      .elementFromPoint(event.clientX, event.clientY)
+      ?.closest<HTMLElement>("[data-row-ticker]")?.dataset.rowTicker
+    if (target) moveRow(dragging, target)
+  }
+
+  function endDrag() {
+    setDragging(null)
+  }
+
+  function moveByKeyboard(ticker: string, event: KeyboardEvent<HTMLButtonElement>) {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return
+    event.preventDefault()
+    adoptDisplayOrder()
+    const order = displayOrderRef.current
+    const index = order.indexOf(ticker)
+    const target = order[index + (event.key === "ArrowUp" ? -1 : 1)]
+    if (!target) return
+    moveRow(ticker, target)
+    // Al mover la fila el DOM se reordena y el botón puede perder el foco.
+    requestAnimationFrame(() =>
+      document.querySelector<HTMLElement>(`[data-drag-handle="${ticker}"]`)?.focus(),
+    )
+  }
+
+  const displayRows = useMemo(() => {
+    const rowByTicker = new Map(result.rows.map((row) => [row.ticker, row]))
+    let order: string[]
+    if (editing && sort && displayOrderRef.current.length > 0) {
+      // Mientras se edita un input no reordenamos: la fila saltaría de lugar
+      // con cada tecla. Se reordena al salir de la tabla.
+      order = displayOrderRef.current.filter((t) => rowByTicker.has(t))
+      for (const row of result.rows) {
+        if (!order.includes(row.ticker)) order.push(row.ticker)
+      }
+    } else if (sort) {
+      const value = (row: RebalanceRow) =>
+        sort.key === "targetPct"
+          ? (rawByTicker.get(row.ticker)?.targetPct ?? 0)
+          : row[sort.key]
+      order = [...result.rows]
+        .sort((a, b) => {
+          const cmp =
+            sort.key === "ticker"
+              ? a.ticker.localeCompare(b.ticker)
+              : Number(value(a) ?? -Infinity) - Number(value(b) ?? -Infinity)
+          return sort.dir === "asc" ? cmp : -cmp
+        })
+        .map((row) => row.ticker)
+    } else {
+      order = result.rows.map((row) => row.ticker)
+    }
+    displayOrderRef.current = order
+    return order.map((t) => rowByTicker.get(t)!)
+  }, [result.rows, sort, editing, rawByTicker])
+
+  const bondCount = result.rows.filter((row) => assetByTicker.get(row.ticker)?.isBond).length
+  const cedearCount = result.rows.length - bondCount
+
   const currentSegments: DonutSegment[] = useMemo(
     () =>
       result.rows
-        .map((row, index) => ({
+        .map((row) => ({
           key: row.ticker,
           label: row.ticker,
           value: row.currentValue,
-          color: donutColor(index),
+          color: colorByTicker.get(row.ticker)!,
         }))
         .filter((s) => s.value > 0),
-    [result.rows],
+    [result.rows, colorByTicker],
   )
 
   const targetSegments: DonutSegment[] = useMemo(
     () =>
       result.rows
-        .map((row, index) => ({
+        .map((row) => ({
           key: row.ticker,
           label: row.ticker,
           // En acumulación el objetivo puede no alcanzarse: mostramos cómo
           // queda la cartera después de la compra.
           value: mode === "accumulate" ? row.newValue : row.targetValue,
-          color: donutColor(index),
+          color: colorByTicker.get(row.ticker)!,
         }))
         .filter((s) => s.value > 0),
-    [result.rows, mode],
+    [result.rows, mode, colorByTicker],
   )
 
   const operations = useMemo(
@@ -317,6 +519,10 @@ export function RebalanceCalculator({
             </Button>
             <Button type="button" variant="outline" size="sm" onClick={distributeEqually}>
               Distribuir 100% en partes iguales
+            </Button>
+            <Button type="button" variant="outline" size="sm" onClick={clearPortfolio}>
+              <Trash2Icon className="size-4" />
+              Vaciar cartera
             </Button>
           </div>
         )}
@@ -468,42 +674,105 @@ export function RebalanceCalculator({
         </section>
 
         {/* Tabla de entradas */}
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-sm text-muted-foreground">
+            <span className="font-medium text-foreground">
+              {result.rows.length} {result.rows.length === 1 ? "activo" : "activos"}
+            </span>{" "}
+            en la cartera
+            {bondCount > 0 &&
+              ` (${cedearCount} ${cedearCount === 1 ? "CEDEAR" : "CEDEARs"} y ${bondCount} ${bondCount === 1 ? "bono" : "bonos"})`}
+            .
+          </p>
+          {sort && (
+            <button
+              type="button"
+              className="text-sm text-muted-foreground underline underline-offset-4 hover:text-foreground"
+              onClick={() => setSort(null)}
+            >
+              Volver a mi orden
+            </button>
+          )}
+        </div>
         <div className="overflow-hidden rounded-lg border">
           <Table className="min-w-[48rem]">
             <TableHeader>
               <TableRow className="bg-muted hover:bg-muted">
-                <TableHead className="min-w-24">Ticker</TableHead>
-                <TableHead className="min-w-24 text-right">Precio</TableHead>
-                <TableHead className="min-w-28 text-right">Nominales</TableHead>
-                <TableHead className="min-w-24 text-right">Valor</TableHead>
-                <TableHead className="min-w-20 text-right">% actual</TableHead>
-                <TableHead className="min-w-28 text-right">% objetivo</TableHead>
+                <TableHead className="w-8">
+                  <span className="sr-only">Reordenar</span>
+                </TableHead>
+                {(
+                  [
+                    ["ticker", "Ticker", "min-w-24"],
+                    ["price", "Precio", "min-w-24 text-right"],
+                    ["quantity", "Nominales", "min-w-28 text-right"],
+                    ["currentValue", "Valor", "min-w-24 text-right"],
+                    ["currentPct", "% actual", "min-w-20 text-right"],
+                    ["targetPct", "% objetivo", "min-w-28 text-right"],
+                  ] as const
+                ).map(([key, label, className]) => (
+                  <TableHead
+                    key={key}
+                    className={className}
+                    aria-sort={
+                      sort?.key === key
+                        ? sort.dir === "asc"
+                          ? "ascending"
+                          : "descending"
+                        : undefined
+                    }
+                  >
+                    <SortButton
+                      label={label}
+                      active={sort?.key === key}
+                      direction={sort?.dir ?? "asc"}
+                      onClick={() => toggleSort(key)}
+                    />
+                  </TableHead>
+                ))}
                 <TableHead className="w-10" />
               </TableRow>
             </TableHeader>
-            <TableBody>
-              {result.rows.map((row) => {
+            <TableBody
+              onFocus={() => setEditing(true)}
+              onBlur={(e) => {
+                if (!e.currentTarget.contains(e.relatedTarget)) setEditing(false)
+              }}
+            >
+              {displayRows.map((row) => {
                 const raw = rawByTicker.get(row.ticker)
                 const isBond = assetByTicker.get(row.ticker)?.isBond ?? false
                 return (
-                <TableRow key={row.ticker} className="bg-card hover:bg-muted/50">
-                  <TableCell>
-                    <span className="flex items-center gap-1.5">
-                      {isBond ? (
-                        <LandmarkIcon
-                          className="size-4 shrink-0 text-muted-foreground"
-                          aria-hidden
-                        />
-                      ) : (
-                        <img
-                          src={logoUrl(row.tickerOriginal) || "/placeholder.svg"}
-                          alt=""
-                          width={16}
-                          height={16}
-                          className="size-4 shrink-0 rounded-sm bg-muted object-contain"
-                          loading="lazy"
-                        />
+                <TableRow
+                  key={row.ticker}
+                  data-row-ticker={row.ticker}
+                  className={cn(
+                    "bg-card hover:bg-muted/50",
+                    dragging === row.ticker && "bg-muted relative z-10 shadow-md",
+                  )}
+                >
+                  <TableCell className="w-8 pr-0">
+                    <button
+                      type="button"
+                      data-drag-handle={row.ticker}
+                      onPointerDown={(e) => startDrag(row.ticker, e)}
+                      onPointerMove={dragOver}
+                      onPointerUp={endDrag}
+                      onPointerCancel={endDrag}
+                      onKeyDown={(e) => moveByKeyboard(row.ticker, e)}
+                      className={cn(
+                        "flex size-7 touch-none items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50",
+                        dragging === row.ticker ? "cursor-grabbing" : "cursor-grab",
                       )}
+                      aria-label={`Mover ${row.ticker}. Arrastrá o usá las flechas arriba y abajo.`}
+                      title="Arrastrá para reordenar"
+                    >
+                      <GripVerticalIcon className="size-4" />
+                    </button>
+                  </TableCell>
+                  <TableCell>
+                    <span className="flex items-center gap-2">
+                      <ColorDot color={colorByTicker.get(row.ticker)} />
                       <span className="font-mono font-medium">{row.ticker}</span>
                     </span>
                     {isBond && (
@@ -631,7 +900,12 @@ export function RebalanceCalculator({
                             {isBuy ? "Comprar" : "Vender"}
                           </span>
                         </TableCell>
-                        <TableCell className="font-mono font-medium">{row.ticker}</TableCell>
+                        <TableCell>
+                          <span className="flex items-center gap-2">
+                            <ColorDot color={colorByTicker.get(row.ticker)} />
+                            <span className="font-mono font-medium">{row.ticker}</span>
+                          </span>
+                        </TableCell>
                         <TableCell className={numericCell}>
                           {Math.abs(row.deltaNominales)}
                         </TableCell>
