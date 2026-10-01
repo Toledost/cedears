@@ -7,11 +7,13 @@ import {
   DownloadIcon,
   FileDownIcon,
   FileUpIcon,
+  LandmarkIcon,
   ScaleIcon,
   Trash2Icon,
 } from "lucide-react"
 import { toast } from "sonner"
 
+import { BOND_QUOTE_BASIS, type Bond } from "@/lib/bonds"
 import { type Cedear, formatArs } from "@/lib/cedears"
 import { logoUrl } from "@/lib/logo"
 import { readPortfolioHoldings } from "@/lib/portfolio"
@@ -53,6 +55,16 @@ type RowState = {
 
 type Mode = "rebalance" | "accumulate"
 
+type Asset = {
+  ticker: string
+  name: string
+  /** Ticker para el logo; null en bonos. */
+  logoTicker: string | null
+  /** Precio en ARS por 1 nominal (los bonos cotizan cada 100). */
+  unitPrice: number | null
+  isBond: boolean
+}
+
 const MODES: { value: Mode; label: string; description: string }[] = [
   {
     value: "rebalance",
@@ -68,15 +80,40 @@ const MODES: { value: Mode; label: string; description: string }[] = [
 
 const numericCell = "text-right font-mono tabular-nums"
 
-export function RebalanceCalculator({ cedears }: { cedears: Cedear[] }) {
+export function RebalanceCalculator({
+  cedears,
+  bonds = [],
+}: {
+  cedears: Cedear[]
+  bonds?: Bond[]
+}) {
   const [rows, setRows] = useState<RowState[]>([])
   const [mode, setMode] = useState<Mode>("rebalance")
   const [contribution, setContribution] = useState<number>(100000)
 
-  const cedearByTicker = useMemo(
-    () => new Map(cedears.map((c) => [c.Cedears, c])),
-    [cedears],
-  )
+  const assetByTicker = useMemo(() => {
+    const assets = new Map<string, Asset>()
+    for (const b of bonds) {
+      assets.set(b.symbol, {
+        ticker: b.symbol,
+        name: b.name,
+        logoTicker: null,
+        unitPrice: b.price / BOND_QUOTE_BASIS,
+        isBond: true,
+      })
+    }
+    // Ante un ticker repetido, gana el CEDEAR.
+    for (const c of cedears) {
+      assets.set(c.Cedears, {
+        ticker: c.Cedears,
+        name: c.Name,
+        logoTicker: c.TickerOriginal,
+        unitPrice: c.price,
+        isBond: false,
+      })
+    }
+    return assets
+  }, [cedears, bonds])
 
   const selectedSet = useMemo(
     () => new Set(rows.map((r) => r.ticker)),
@@ -109,7 +146,7 @@ export function RebalanceCalculator({ cedears }: { cedears: Cedear[] }) {
   function importFromPortfolio() {
     const holdings = readPortfolioHoldings()
     const entries = Object.entries(holdings).filter(([ticker]) =>
-      cedearByTicker.has(ticker),
+      assetByTicker.has(ticker),
     )
     if (entries.length === 0) return
     setRows(
@@ -134,7 +171,7 @@ export function RebalanceCalculator({ cedears }: { cedears: Cedear[] }) {
     a.remove()
     URL.revokeObjectURL(url)
     toast.success("Cartera exportada", {
-      description: `${rows.length} CEDEARs. Podés volver a importarla con "Importar CSV".`,
+      description: `${rows.length} activos. Podés volver a importarla con "Importar CSV".`,
     })
   }
 
@@ -144,13 +181,13 @@ export function RebalanceCalculator({ cedears }: { cedears: Cedear[] }) {
     if (!file) return
 
     const entries = parsePortfolioCsv(await file.text())
-    const known = entries.filter((e) => cedearByTicker.has(e.ticker))
-    const unknown = entries.filter((e) => !cedearByTicker.has(e.ticker))
+    const known = entries.filter((e) => assetByTicker.has(e.ticker))
+    const unknown = entries.filter((e) => !assetByTicker.has(e.ticker))
 
     if (known.length === 0) {
       toast.error("No se pudo importar el archivo", {
         description:
-          "No encontramos CEDEARs válidos. El formato esperado es: ticker,nominales,objetivo_pct",
+          "No encontramos CEDEARs ni bonos válidos. El formato esperado es: ticker,nominales,objetivo_pct",
       })
       return
     }
@@ -159,8 +196,8 @@ export function RebalanceCalculator({ cedears }: { cedears: Cedear[] }) {
     toast.success("Cartera importada", {
       description:
         unknown.length > 0
-          ? `${known.length} CEDEARs. Se omitieron tickers desconocidos: ${unknown.map((e) => e.ticker).join(", ")}.`
-          : `${known.length} CEDEARs.`,
+          ? `${known.length} activos. Se omitieron tickers desconocidos: ${unknown.map((e) => e.ticker).join(", ")}.`
+          : `${known.length} activos.`,
     })
   }
 
@@ -186,21 +223,21 @@ export function RebalanceCalculator({ cedears }: { cedears: Cedear[] }) {
     () =>
       rows
         .map((r): RebalanceInput | null => {
-          const cedear = cedearByTicker.get(r.ticker)
-          if (!cedear) return null
+          const asset = assetByTicker.get(r.ticker)
+          if (!asset) return null
           return {
             cedear: {
-              Cedears: cedear.Cedears,
-              Name: cedear.Name,
-              TickerOriginal: cedear.TickerOriginal,
-              price: cedear.price,
+              Cedears: asset.ticker,
+              Name: asset.name,
+              TickerOriginal: asset.logoTicker ?? "",
+              price: asset.unitPrice,
             },
             quantity: r.quantity,
             targetPct: r.targetPct,
           }
         })
         .filter((v): v is RebalanceInput => v !== null),
-    [rows, cedearByTicker],
+    [rows, assetByTicker],
   )
 
   const accumulation = useMemo(
@@ -253,7 +290,12 @@ export function RebalanceCalculator({ cedears }: { cedears: Cedear[] }) {
   return (
     <div className="flex flex-col gap-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <CedearPicker cedears={cedears} selected={selectedSet} onAdd={addTicker} />
+        <CedearPicker
+          cedears={cedears}
+          bonds={bonds}
+          selected={selectedSet}
+          onAdd={addTicker}
+        />
         {rows.length > 0 && (
           <div className="flex flex-wrap gap-2">
             <Button type="button" variant="outline" size="sm" onClick={importFromPortfolio}>
@@ -289,7 +331,7 @@ export function RebalanceCalculator({ cedears }: { cedears: Cedear[] }) {
             </EmptyMedia>
             <EmptyTitle>Armá tu cartera</EmptyTitle>
             <EmptyDescription>
-              Agregá CEDEARs y cargá cuántos nominales tenés de cada uno para ver
+              Agregá CEDEARs o bonos y cargá cuántos nominales tenés de cada uno para ver
               la composición actual y calcular el rebalanceo.
             </EmptyDescription>
           </EmptyHeader>
@@ -442,22 +484,44 @@ export function RebalanceCalculator({ cedears }: { cedears: Cedear[] }) {
             <TableBody>
               {result.rows.map((row) => {
                 const raw = rawByTicker.get(row.ticker)
+                const isBond = assetByTicker.get(row.ticker)?.isBond ?? false
                 return (
                 <TableRow key={row.ticker} className="bg-card hover:bg-muted/50">
                   <TableCell>
                     <span className="flex items-center gap-1.5">
-                      <img
-                        src={logoUrl(row.tickerOriginal) || "/placeholder.svg"}
-                        alt=""
-                        width={16}
-                        height={16}
-                        className="size-4 shrink-0 rounded-sm bg-muted object-contain"
-                        loading="lazy"
-                      />
+                      {isBond ? (
+                        <LandmarkIcon
+                          className="size-4 shrink-0 text-muted-foreground"
+                          aria-hidden
+                        />
+                      ) : (
+                        <img
+                          src={logoUrl(row.tickerOriginal) || "/placeholder.svg"}
+                          alt=""
+                          width={16}
+                          height={16}
+                          className="size-4 shrink-0 rounded-sm bg-muted object-contain"
+                          loading="lazy"
+                        />
+                      )}
                       <span className="font-mono font-medium">{row.ticker}</span>
                     </span>
+                    {isBond && (
+                      <span className="block text-xs text-muted-foreground">{row.name}</span>
+                    )}
                   </TableCell>
-                  <TableCell className={numericCell}>{formatArs(row.price)}</TableCell>
+                  <TableCell className={numericCell}>
+                    {isBond && row.price !== null ? (
+                      <>
+                        {formatArs(row.price * BOND_QUOTE_BASIS)}
+                        <span className="block text-xs text-muted-foreground">
+                          c/100 VN
+                        </span>
+                      </>
+                    ) : (
+                      formatArs(row.price)
+                    )}
+                  </TableCell>
                   <TableCell className={numericCell}>
                     <Input
                       type="number"
@@ -608,7 +672,7 @@ export function RebalanceCalculator({ cedears }: { cedears: Cedear[] }) {
           )}
           {result.hasMissingPrices && (
             <p className="text-sm text-destructive">
-              Algunos CEDEARs no tienen precio disponible y se excluyen del cálculo.
+              Algunos activos no tienen precio disponible y se excluyen del cálculo.
             </p>
           )}
         </section>
